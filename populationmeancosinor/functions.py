@@ -6,6 +6,7 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 
 from statsmodels.stats.multitest import multipletests, fdrcorrection
 from scipy.stats import t, f
@@ -14,8 +15,10 @@ from sklearn.preprocessing import scale, MinMaxScaler
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score, explained_variance_score
 from tfce_mediation.pyfunc import convert_fs
-from scipy.stats import circmean, circstd, norm
+from scipy.stats import circmean, circstd, norm, vonmises
 from itertools import combinations
+from mne.viz import circular_layout, plot_connectivity_circle
+
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -116,6 +119,124 @@ class population_mean_cosinor():
 		self.K = len(self.ugroups_)
 		self.df1 = 2*self.n_period_
 		self.df2 = self.K - self.df1
+
+	def _circularstatics(self, theta, min_theta = 0, max_theta = 2*np.pi, bias_correct_kappa = True, axis = 0):
+		# convert to radians
+		n = len(theta)
+		theta_rad = (theta - min_theta)*2.*np.pi / (max_theta - min_theta)
+		# 2.2.2
+		C_ = np.divide(np.sum(np.cos(theta_rad), axis = axis), n)
+		S_ = np.divide(np.sum(np.sin(theta_rad), axis = axis), n)
+		# 2.2.3 mean resuultant length
+		R = np.sqrt(C_**2 + S_**2)
+		
+		# 2.2.4
+		mean_theta = np.arctan(S_/C_)
+		mean_theta[C_ < 0] = mean_theta[C_ < 0] + np.pi
+		# move to positive to be more human readable
+		mean_theta[mean_theta < 0] = mean_theta[mean_theta < 0] + 2*np.pi
+		std_theta = np.sqrt(-2*np.log(R))
+		
+		# Mardia and Jupp 2000 pg.85-86
+		kappa = np.zeros_like(R)
+		kappa[R<0.53] = (2*R[R<0.53]) + (R[R<0.53]**3) + (np.divide(5,6)*(R[R<0.53]**5)) # 5.3.7
+		kappa[(R>=0.53) & (R<0.85)] = -0.4 + (1.39 * R[(R>=0.53) & (R<0.85)]) + np.divide(0.43, (1 - R[(R>=0.53) & (R<0.85)]))
+		kappa[R>=0.85] = np.divide(1,((R[R>=0.85]**3) - (4*R[R>=0.85]**2) + (3*R[R>=0.85])))
+		if bias_correct_kappa:
+			kappa[kappa<2] = np.maximum(kappa[kappa<2] - (2/n*kappa[kappa<2]),0)
+			kappa[(kappa<=2) & (kappa<15)] = np.divide(((n-1)**3 * kappa[(kappa<=2) & (kappa<15)]),(n*(n**2+1)))
+		return(theta_rad, mean_theta, std_theta, R, kappa)
+
+	def compare_acrophases(self, subset_model_significant = True, csv_basename = None, plot_smallest_p = True):
+		if subset_model_significant:
+			combos = combinations(np.argwhere(self.qval_model_targets_ < 0.05)[:,0], 2)
+			n_combos = len(list(combos))
+			combos = combinations(np.argwhere(self.qval_model_targets_ < 0.05)[:,0], 2)  #iter tools weirdness
+		else:
+			combos = combinations(range(self.n_targets_), 2)
+			n_combos = len(list(combos))
+			combos = combinations(range(self.n_targets_), 2)
+		if n_combos != 0:
+			loc = 0
+			corrmat = np.zeros((self.n_targets_, self.n_targets_))
+			contrast = []
+			pvalues_forwards = np.zeros((n_combos))
+			pvalues_backwards = np.zeros((n_combos))
+			pvalues = np.ones((n_combos))
+			effect_direction = np.ones((n_combos))
+			differences = np.zeros((n_combos))
+			for i,j in combos:
+				if loc % 100 == 0:
+					print(loc, n_combos)
+				contrast.append("%d_%d" % (i,j))
+				dist1 = np.abs(self.bootstrapped_acrophases_distributions_[:,i])
+				dist2 = np.abs(self.bootstrapped_acrophases_distributions_[:,j])
+				grandmean = circmean(np.concatenate((dist1, dist2)))
+				dist1 = dist1 - circmean(dist1) + grandmean
+				dist2 = dist2 - circmean(dist2) + grandmean
+				kappa = self._circularstatics(np.concatenate((dist1, dist2)).reshape(-1,1))[-1]
+				pvalues_forwards[loc] = vonmises.sf(self.bootstrap_CI_acrophase_mean_[i], kappa, grandmean)
+				pvalues_backwards[loc] = vonmises.sf(self.bootstrap_CI_acrophase_mean_[j], kappa, grandmean)
+				corrmat[i,j] = np.abs(self.bootstrap_CI_acrophase_mean_[i] - self.bootstrap_CI_acrophase_mean_[j])
+				corrmat[j,i] = np.abs(self.bootstrap_CI_acrophase_mean_[i] - self.bootstrap_CI_acrophase_mean_[j])
+				differences[loc] = np.divide(np.abs(self.bootstrap_CI_acrophase_mean_[i] - self.bootstrap_CI_acrophase_mean_[j]) * self.period_[0], 2*np.pi)
+				loc += 1
+			pvalues[pvalues_forwards < pvalues_backwards] = pvalues_forwards[pvalues_forwards < pvalues_backwards]
+			pvalues[pvalues_backwards < pvalues_forwards] = pvalues_backwards[pvalues_backwards < pvalues_forwards]
+			effect_direction[pvalues_backwards < pvalues_forwards] = -1
+			if plot_smallest_p:
+				i_, j_ = contrast[np.argmin(pvalues)].split("_")
+				self.plot_acrophase_difference(int(i_), int(j_), png_basename = csv_basename)
+			if csv_basename is not None:
+				pdOUT = pd.DataFrame()
+				pdOUT["Contrast"] = contrast
+				pdOUT["Effect_Direction"] = effect_direction
+				pdOUT["p-value"] = pvalues
+				pdOUT.to_csv("Results_compare_acrophases_%s.csv" % csv_basename, index=None)
+			else:
+				return(corrmat, contrast, effect_direction, pvalues)
+
+
+	def plot_acrophase_difference(self, i, j, png_basename = None):
+		dist1 = np.abs(self.bootstrapped_acrophases_distributions_[:,i])
+		dist2 = np.abs(self.bootstrapped_acrophases_distributions_[:,j])
+		grandmean = circmean(np.concatenate((dist1, dist2)))
+		dist1 = dist1 - circmean(dist1) + grandmean
+		dist2 = dist2 - circmean(dist2) + grandmean
+		kappa = self._circularstatics(np.concatenate((dist1, dist2)).reshape(-1,1))[-1]
+		if kappa > 50:
+			n_bins = 100
+		else:
+			n_bins = 50
+		pvalue = min(vonmises.sf(self.bootstrap_CI_acrophase_mean_[i], kappa, grandmean), vonmises.sf(self.bootstrap_CI_acrophase_mean_[j], kappa, grandmean))[0]
+		if png_basename is not None:
+			print("%s\t[Acrophase[i] = %1.2f Acrophase[j] = %1.2f], circular mean[null] = %1.2f, kappa = %1.2f, p = %1.3e" % (png_basename, (self.bootstrap_CI_acrophase_mean_[i]*24*0.5/np.pi), (self.bootstrap_CI_acrophase_mean_[j]*24*0.5/np.pi), grandmean*24*0.5/np.pi, kappa, pvalue))
+		else:
+			print("[Acrophase[i] = %1.2f Acrophase[j] = %1.2f], circular mean[null] = %1.2f, kappa = %1.2f, p = %1.3e" % ((self.bootstrap_CI_acrophase_mean_[i]*24*0.5/np.pi), (self.bootstrap_CI_acrophase_mean_[j]*24*0.5/np.pi), grandmean*24*0.5/np.pi, kappa, pvalue))
+		x = np.arange(0, 2*np.pi, np.pi/4)
+		x_labels = list(map(lambda i: 'T ' + str(i) + " ", list((x/(2*np.pi) * self.period_[0]).astype(int))))
+		x_labels[1::2] = [""]*len(x_labels[1::2])
+		fig = plt.figure()
+		ax = fig.add_subplot(projection='polar', theta_offset=(np.pi/2), theta_direction = -1)
+		ax.hist(np.concatenate((dist1,dist2)), bins=n_bins, bottom=1, rwidth = 1, density=True)
+		x_error = np.linspace(self.bootstrap_CI_acrophase_lower_[i], self.bootstrap_CI_acrophase_upper_[i], 100)
+		ax.plot(x_error, np.ones_like(x_error)*1.45, scalex=False, scaley = False, c = 'k')
+		ax.scatter(self.bootstrap_CI_acrophase_mean_[i], y = 1.45, c = 'k')
+		x_error = np.linspace(self.bootstrap_CI_acrophase_lower_[j], self.bootstrap_CI_acrophase_upper_[j], 100)
+		ax.plot(x_error, np.ones_like(x_error)*1.55, scalex=False, scaley = False, c = 'k')
+		ax.scatter(self.bootstrap_CI_acrophase_mean_[j], y = 1.55, c = 'k')
+		ax.set_yticklabels([""])
+		ax.set_xticks(x)
+		ax.set_xticklabels(x_labels)
+		ax.set_facecolor('#f0f0f0')
+		plt.axvspan((20*(2*np.pi)/24), (24*(2*np.pi)/24), color = 'k', alpha = 0.2)
+		plt.axvspan(0, (6*(2*np.pi)/24), color = 'k', alpha = 0.2)
+		plt.tight_layout()
+		if png_basename is not None:
+			plt.savefig("%s_acrophase_difference_%d_%d.png" % (png_basename, i, j))
+			plt.close()
+		else:
+			plt.show()
 
 	def predict(self, X, add_popmesor = False, convert_time = False):
 		"""
@@ -296,34 +417,9 @@ class population_mean_cosinor():
 		bindex = np.random.permutation(subindex)[:split_size]
 		bcoef = subject_coef[bindex].mean(0)
 		bmesor = subject_mesor[bindex].mean(0)
-		bamp, bacr, bacrtime = self._coef_to_cosinor_metrics(bcoef, period)
-		return(bmesor,bamp, bacr, bacrtime)
+		bamp, bacr, _ = self._coef_to_cosinor_metrics(bcoef, period)
+		return(bmesor,bamp, bacr)
 
-	def _compare_acrophases(self, subset_model_significant = True):
-		if subset_model_significant:
-			combos = combinations(np.argwhere(self.qval_model_targets_ < 0.05)[:,0], 2)
-			n_combos = len(list(combos))
-			combos = combinations(np.argwhere(self.qval_model_targets_ < 0.05)[:,0], 2)  #iter tools weirdness
-		else:
-			combos = combinations(range(self.n_targets_), 2)
-			n_combos = len(list(combos))
-			combos = combinations(range(self.n_targets_), 2)
-		tvalues = np.zeros((n_combos))
-		absmdvalues = np.zeros((n_combos))
-		corrmat = np.zeros((self.n_targets_, self.n_targets_))
-		contrast = []
-		loc = 0
-		for i,j in combos: 
-			tvalues[loc] = np.divide((self.bootstrap_CI_acrophase_mean_[i] - self.bootstrap_CI_acrophase_mean_[j]), np.sqrt(np.divide(self.bootstrap_CI_acrophase_std_[i] + self.bootstrap_CI_acrophase_std_[j], self.K)))
-			absmdvalues[loc] = np.abs(self.bootstrap_CI_acrophase_mean_[i] - self.bootstrap_CI_acrophase_mean_[j])
-			contrast.append("%d_%d" % (i,j))
-			corrmat[i,j] = np.abs(self.bootstrap_CI_acrophase_mean_[i] - self.bootstrap_CI_acrophase_mean_[j])
-			corrmat[j,i] = np.abs(self.bootstrap_CI_acrophase_mean_[i] - self.bootstrap_CI_acrophase_mean_[j])
-			loc += 1
-		contrast = np.array(contrast)
-		pval = 2*(1 - t.cdf(abs(tvalues), (self.K-1)))
-		qval = fdrcorrection(pval)[1]
-		return(tvalues, absmdvalues, contrast, pval, qval, corrmat)
 
 	def fit_pop_mean(self, fit_mesor = True, bootstrap_group = True, fit_summary_targets = True, fit_pca = False):
 		"""
@@ -394,34 +490,38 @@ class population_mean_cosinor():
 			if bootstrap_group:
 				period = self.period_[c]
 				seeds = generate_seeds(self.n_bootstraps)
-				bmesor, bamplitude, bacrophase, bacrophasetime = zip(*[self._bootstrapCI(i, period = period, subject_coef = self.subject_coef_[:,:,(c*2):(c*2 + 2)], split = 0.5, seed = None) for i in range(self.n_bootstraps)])
+				bmesor, bamplitude, bacrophase = zip(*[self._bootstrapCI(i, period = period, subject_coef = self.subject_coef_[:,:,(c*2):(c*2 + 2)], split = 0.5, seed = None) for i in range(self.n_bootstraps)])
+
+				bootstrap_CI_mesor_mean_ = np.mean(bmesor,0)
 				bootstrap_CI_mesor_upper_ = np.quantile(bmesor, 0.95, axis = 0) 
 				bootstrap_CI_mesor_lower_ = np.quantile(bmesor, 0.05, axis = 0)
+				bootstrap_CI_amplitude_mean_ = np.mean(bamplitude,0)
 				bootstrap_CI_amplitude_upper_ = np.quantile(bamplitude, 0.95, axis = 0) 
 				bootstrap_CI_amplitude_lower_ = np.quantile(bamplitude, 0.05, axis = 0) 
+
+				theta_rad_, bootstrap_CI_acrophase_mean_, bootstrap_CI_acrophase_std_, bootstrap_CI_acrophase_R_, bootstrap_CI_acrophase_kappa_ = self._circularstatics(np.array(bacrophase),
+																									min_theta = 0,
+																									max_theta = -2*np.pi,
+																									bias_correct_kappa = True,
+																									axis = 0)
+
+				upper_rad = vonmises.interval(0.95, bootstrap_CI_acrophase_kappa_)[1]
+
+				bootstrap_CI_acrophase_lower_, bootstrap_CI_acrophase_upper_ = vonmises.interval(0.95, bootstrap_CI_acrophase_kappa_, bootstrap_CI_acrophase_mean_)
 				
-				self.temp = np.array(bacrophase)
-				bootstrap_CI_mesor_mean_ = np.mean(bmesor,0)
-				bootstrap_CI_amplitude_mean_ = np.mean(bamplitude,0)
-				bootstrap_CI_acrophase_mean_ = circmean(bacrophase, low = -2*np.pi, high=0, axis = 0)
-				bootstrap_CI_acrophase_std_ = circstd(bacrophase, low = -2*np.pi, high=0, axis = 0)
-				acro_error_CI = np.divide(norm.ppf(.975)*bootstrap_CI_acrophase_std_, np.sqrt(self.K * 0.5)) # alpha = 0.05, N = n_subject * split size
-				bootstrap_CI_acrophase_upper_ = bootstrap_CI_acrophase_mean_ - acro_error_CI
-				bootstrap_CI_acrophase_lower_ = bootstrap_CI_acrophase_mean_ + acro_error_CI
+				bootstrap_CI_acrophase_time_mean_ = np.divide(bootstrap_CI_acrophase_mean_ * period, 2*np.pi)
+				bootstrap_CI_acrophase_time_std_ = np.divide(bootstrap_CI_acrophase_std_ * period, 2*np.pi)
+				bootstrap_CI_acrophase_time_lower_ = np.divide(bootstrap_CI_acrophase_lower_ * period, 2*np.pi)
+				bootstrap_CI_acrophase_time_upper_ = np.divide(bootstrap_CI_acrophase_upper_ * period, 2*np.pi)
 
-				bootstrap_CI_acrophase_time_mean_ = circmean(bacrophasetime, low = 0, high=24, axis = 0)
-				bootstrap_CI_acrophase_time_std_ = circstd(bacrophasetime, low = 0, high=24, axis = 0)
-				acrotime_error_CI = np.divide(norm.ppf(.975)*bootstrap_CI_acrophase_time_std_, np.sqrt(self.K * 0.5))
-
-				bootstrap_CI_acrophase_time_upper_ = bootstrap_CI_acrophase_time_mean_ + acrotime_error_CI
-#				bootstrap_CI_acrophase_time_upper_[bootstrap_CI_acrophase_time_upper_>period] -= period
-				bootstrap_CI_acrophase_time_lower_ = bootstrap_CI_acrophase_time_mean_ - acrotime_error_CI
-#				bootstrap_CI_acrophase_time_lower_[bootstrap_CI_acrophase_time_lower_>period] -= period
 				if c == 0:
 					self.bootstrap_CI_mesor_mean_ = bootstrap_CI_mesor_mean_
 					self.bootstrap_CI_amplitude_mean_ = bootstrap_CI_amplitude_mean_
 					self.bootstrap_CI_acrophase_mean_ = bootstrap_CI_acrophase_mean_
 					self.bootstrap_CI_acrophase_std_ = bootstrap_CI_acrophase_std_
+					
+					self.bootstrap_CI_acrophase_time_mean_ = bootstrap_CI_acrophase_time_mean_
+					self.bootstrap_CI_acrophase_time_std_ = bootstrap_CI_acrophase_time_std_
 					self.bootstrap_CI_mesor_upper_ = bootstrap_CI_mesor_upper_
 					self.bootstrap_CI_mesor_lower_ = bootstrap_CI_mesor_lower_
 					self.bootstrap_CI_amplitude_upper_ = bootstrap_CI_amplitude_upper_
@@ -430,11 +530,19 @@ class population_mean_cosinor():
 					self.bootstrap_CI_acrophase_lower_ = bootstrap_CI_acrophase_lower_
 					self.bootstrap_CI_acrophase_time_upper_ = bootstrap_CI_acrophase_time_upper_
 					self.bootstrap_CI_acrophase_time_lower_ = bootstrap_CI_acrophase_time_lower_
+					
+					self.theta_rad_ = theta_rad_
+					self.bootstrap_CI_acrophase_R_ = bootstrap_CI_acrophase_R_
+					self.bootstrap_CI_acrophase_kappa_ = bootstrap_CI_acrophase_kappa_
+					self.bootstrapped_acrophases_distributions_ = np.array(bacrophase)
+					
 				else:
 					self.bootstrap_CI_mesor_mean_ = np.column_stack((self.bootstrap_CI_mesor_mean_, bootstrap_CI_mesor_mean_))
 					self.bootstrap_CI_amplitude_mean_ = np.column_stack((self.bootstrap_CI_amplitude_mean_, bootstrap_CI_amplitude_mean_))
 					self.bootstrap_CI_acrophase_mean_ = np.column_stack((self.bootstrap_CI_acrophase_mean_, bootstrap_CI_acrophase_mean_))
 					self.bootstrap_CI_acrophase_std_ = np.column_stack((self.bootstrap_CI_acrophase_std_, bootstrap_CI_acrophase_std_))
+					self.bootstrap_CI_acrophase_time_mean_ = np.column_stack((self.bootstrap_CI_acrophase_time_mean_, bootstrap_CI_acrophase_time_mean_))
+					self.bootstrap_CI_acrophase_time_std_ = np.column_stack((self.bootstrap_CI_acrophase_time_std_, bootstrap_CI_acrophase_time_std_))
 					self.bootstrap_CI_mesor_upper_ = np.column_stack((self.bootstrap_CI_mesor_upper_, bootstrap_CI_mesor_upper_))
 					self.bootstrap_CI_mesor_lower_ = np.column_stack((self.bootstrap_CI_mesor_lower_, bootstrap_CI_mesor_lower_))
 					self.bootstrap_CI_amplitude_upper_ = np.column_stack((self.bootstrap_CI_amplitude_upper_,bootstrap_CI_amplitude_upper_))
@@ -443,6 +551,10 @@ class population_mean_cosinor():
 					self.bootstrap_CI_acrophase_lower_ = np.column_stack((self.bootstrap_CI_acrophase_lower_,bootstrap_CI_acrophase_lower_))
 					self.bootstrap_CI_acrophase_time_upper_ = np.column_stack((self.bootstrap_CI_acrophase_time_upper_,bootstrap_CI_acrophase_time_upper_))
 					self.bootstrap_CI_acrophase_time_lower_ = np.column_stack((self.bootstrap_CI_acrophase_time_lower_,bootstrap_CI_acrophase_time_lower_))
+
+					self.theta_rad_ = np.column_stack((self.theta_rad_, theta_rad_))
+					self.bootstrap_CI_acrophase_R_ = np.column_stack((self.bootstrap_CI_acrophase_R_, bootstrap_CI_acrophase_R_))
+					self.bootstrap_CI_acrophase_kappa_ = np.column_stack((self.bootstrap_CI_acrophase_kappa_, bootstrap_CI_acrophase_kappa_))
 
 		# calculate least squares metrics
 		self.MSS_ = np.sum((self.yhat_ - self.ytrue_.mean(0))**2, 0)
@@ -620,29 +732,34 @@ class population_mean_cosinor():
 		else:
 			plt.show()
 
-	def plot_bootstrap_acrophase(self, png_basename = None):
+	def plot_bootstrap_acrophase(self, png_basename = None, plot_nonsignificant = False):
 		plt.figure(figsize=(6, 12))
 		sort_idx = np.argsort(self.pop_acrophase_time_[0])
 		significance = self.qval_model_targets_[sort_idx]
 		sacr = np.array(self.pop_acrophase_time_[0][sort_idx])
 		sacr_err = np.array(self.bootstrap_CI_acrophase_time_upper_[sort_idx]) - sacr
+		loc = 0
 		for i in range(self.n_targets_):
 			if significance[i] < 0.05:
-				plt.errorbar(sacr[i], i, xerr=sacr_err[i], marker='s', color = 'k', alpha = 1.0)
+				plt.errorbar(sacr[i], loc, xerr=sacr_err[i], marker='s', mec ='k', color = cm.hsv_r(sacr[i]/24.0), capsize = 4,  alpha = 1.0)
+				loc += 1
 			else:
-				plt.errorbar(sacr[i], i, xerr=sacr_err[i], marker='s', color = 'grey', alpha = 0.5)
-		plt.axvspan(-0.1, 6, color = 'grey', alpha = 0.2)
-		plt.axvspan(20, 24.1, color = 'grey', alpha = 0.2)
+				if plot_nonsignificant:
+					loc += 1
+					plt.errorbar(sacr[i], loc, xerr=sacr_err[i], marker='s', color = 'grey', alpha = 0.5)
+		plt.axvspan(-4, 6, color = 'k', alpha = 0.2)
+		plt.axvspan(20, 30, color = 'k', alpha = 0.2)
 		plt.xticks(np.arange(0,25, 1), range(25))
 		plt.xlabel("Time (h)")
+		ax = plt.gca()
+		ax.set_facecolor('darkgrey')
 		plt.tight_layout()
-		plt.xlim(-0.1, 24.1)
+		plt.xlim(-1, 25)
 		if png_basename is not None:
 			plt.savefig("%s_acrophase_bootstrap_error.png" % png_basename)
 			plt.close()
 		else:
 			plt.show()
-		
 
 	def plot_circular(self, png_basename = None, set_r_to_neglogp = False, set_r_to_r2 = False):
 		x = np.arange(0, 2*np.pi, np.pi/4)
@@ -684,61 +801,61 @@ class population_mean_cosinor():
 		else:
 			plt.show()
 
-#	def _permute_amplitude(self, p, seed):
-#		if seed is None:
-#			np.random.seed(np.random.randint(4294967295))
-#		else:
-#			np.random.seed(seed)
-#		perm_coefs = []
-#		for group in self.ugroups_:
-#			pX = np.random.permutation(self.X[self.groups_ == group])
-#			permlm = LinearRegression(fit_intercept=True).fit(pX, self.y[self.groups_ == group])
-#			perm_coefs.append(permlm.coef_)
-#		perm_mean_coef_ = np.mean(perm_coefs, 0)
-#		perm_amp = []
-#		for p in range(self.n_period_):
-#			per_coef = perm_mean_coef_[:,(p*2):(p*2 + 2)]
-#			perm_amp.append(np.sqrt((per_coef[:,0]**2) + (per_coef[:,1]**2)))
-#		return(np.array(perm_amp))
+	def _permute_amplitude(self, p, seed):
+		if seed is None:
+			np.random.seed(np.random.randint(4294967295))
+		else:
+			np.random.seed(seed)
+		perm_coefs = []
+		for group in self.ugroups_:
+			pX = np.random.permutation(self.X[self.groups_ == group])
+			permlm = LinearRegression(fit_intercept=True).fit(pX, self.y[self.groups_ == group])
+			perm_coefs.append(permlm.coef_)
+		perm_mean_coef_ = np.mean(perm_coefs, 0)
+		perm_amp = []
+		for p in range(self.n_period_):
+			per_coef = perm_mean_coef_[:,(p*2):(p*2 + 2)]
+			perm_amp.append(np.sqrt((per_coef[:,0]**2) + (per_coef[:,1]**2)))
+		return(np.array(perm_amp))
 
-#	def _permute_popmodel(self, p, seed = None):
-#		if seed is None:
-#			np.random.seed(np.random.randint(4294967295))
-#		else:
-#			np.random.seed(seed)
-#		perm_m_pop = []
-#		perm_coefs = []
-#		perm_X = []
-#		for group in self.ugroups_:
-#			pX = np.random.permutation(self.X[self.groups_ == group])
-#			perm_X.append(pX)
-#			permlm = LinearRegression(fit_intercept=True).fit(pX, self.y[self.groups_ == group])
-#			perm_m_pop.append(permlm.intercept_)
-#			perm_coefs.append(permlm.coef_)
-#		perm_X = np.concatenate(perm_X)
-#		perm_mean_mesor_ = np.mean(perm_m_pop, 0)
-#		perm_mean_coef_ = np.mean(perm_coefs, 0)
-#		perm_yhat = np.dot(perm_X, perm_mean_coef_.T)
-#		if self.fit_mesor:
-#			perm_yhat += perm_mean_mesor_
-#			ytrue = np.array(self.y)
-#		else:
-#			ytrue = np.array(self.y_demesor_)
-#		perm_r2_model = r2_score(perm_yhat, ytrue)
-#		perm_r2_model_targets = r2_score(perm_yhat, ytrue, multioutput='raw_values')
-#		return(perm_r2_model, perm_r2_model_targets)
+	def _permute_popmodel(self, p, seed = None):
+		if seed is None:
+			np.random.seed(np.random.randint(4294967295))
+		else:
+			np.random.seed(seed)
+		perm_m_pop = []
+		perm_coefs = []
+		perm_X = []
+		for group in self.ugroups_:
+			pX = np.random.permutation(self.X[self.groups_ == group])
+			perm_X.append(pX)
+			permlm = LinearRegression(fit_intercept=True).fit(pX, self.y[self.groups_ == group])
+			perm_m_pop.append(permlm.intercept_)
+			perm_coefs.append(permlm.coef_)
+		perm_X = np.concatenate(perm_X)
+		perm_mean_mesor_ = np.mean(perm_m_pop, 0)
+		perm_mean_coef_ = np.mean(perm_coefs, 0)
+		perm_yhat = np.dot(perm_X, perm_mean_coef_.T)
+		if self.fit_mesor:
+			perm_yhat += perm_mean_mesor_
+			ytrue = np.array(self.y)
+		else:
+			ytrue = np.array(self.y_demesor_)
+		perm_r2_model = r2_score(perm_yhat, ytrue)
+		perm_r2_model_targets = r2_score(perm_yhat, ytrue, multioutput='raw_values')
+		return(perm_r2_model, perm_r2_model_targets)
 
-#	def permute_popop_cosinor(self):
-#		seeds = generate_seeds(self.n_permutations)
-#		output = Parallel(n_jobs = self.n_jobs, backend='multiprocessing')(delayed(self._permute_popmodel)(p = p, seed = seeds[p]) for p in range(self.n_permutations))
-#		permR2, permR2targets = zip(*output)
-#		self.perm_R2_model_ = np.array(permR2)
-#		self.perm_R2_model_targets_ = np.array(permR2targets)
+	def permute_popop_cosinor(self):
+		seeds = generate_seeds(self.n_permutations)
+		output = Parallel(n_jobs = self.n_jobs, backend='multiprocessing')(delayed(self._permute_popmodel)(p = p, seed = seeds[p]) for p in range(self.n_permutations))
+		permR2, permR2targets = zip(*output)
+		self.perm_R2_model_ = np.array(permR2)
+		self.perm_R2_model_targets_ = np.array(permR2targets)
 
-#	def permute_popop_cosinor_amplitude(self):
-#		seeds = generate_seeds(self.n_permutations)
-#		permAmplitude = np.array(Parallel(n_jobs = self.n_jobs, backend='multiprocessing')(delayed(self._permute_amplitude)(p = p, seed = seeds[p]) for p in range(self.n_permutations)))
-#		self.perm_amplitude_ = np.array(permAmplitude).swapaxes(0,1)
+	def permute_popop_cosinor_amplitude(self):
+		seeds = generate_seeds(self.n_permutations)
+		permAmplitude = np.array(Parallel(n_jobs = self.n_jobs, backend='multiprocessing')(delayed(self._permute_amplitude)(p = p, seed = seeds[p]) for p in range(self.n_permutations)))
+		self.perm_amplitude_ = np.array(permAmplitude).swapaxes(0,1)
 
 	def _coef_to_cosinor_metrics(self, coef, period):
 		amplitude = np.sqrt((coef[:,0]**2) + (coef[:,1]**2))
@@ -805,4 +922,3 @@ class population_mean_cosinor():
 				acr_c = np.squeeze(acr)
 			yhat = yhat + (amp*np.cos((2*np.pi*time_variable_)/per + acr))
 		return(yhat)
-
